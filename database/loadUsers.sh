@@ -9,9 +9,9 @@ CREATE TABLE IF NOT EXISTS UserGroups (id INT NOT NULL AUTO_INCREMENT PRIMARY KE
 CREATE TABLE IF NOT EXISTS ReadingPolicy (PolicyID INT NOT NULL AUTO_INCREMENT PRIMARY KEY, userID INT, groupID INT);
 
 INSERT INTO Users (username,password) VALUES
-    	('adriana','12345678'),
-	('elisabeth','87654321'),
-	('john','smith');
+    	('u1','p1'),
+	('u2','p2'),
+	('u3','p3');
 
 
 SELECT * from Credentials;
