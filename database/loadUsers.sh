@@ -14,7 +14,7 @@ INSERT INTO Users (username,password) VALUES
 	('u3','p3');
 
 
-SELECT * from Credentials;
+SELECT * from Users;
 
 
 INSERT INTO Groups (groupName, owner) VALUES
