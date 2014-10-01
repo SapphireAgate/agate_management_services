@@ -45,7 +45,6 @@ void _finish_with_error(MYSQL *con, bool rollback)
 /*
  *  Commands
  */
-
 static bool login(int sockfd, char* command) {
     // TODO: not thread safe
     char* username = strtok(command, " ");
@@ -98,6 +97,7 @@ static bool login(int sockfd, char* command) {
     _agate_util_write_x_bytes_to_socket(sockfd, out, out_len);
     mysql_close(db_con);
     free(query);
+    free(out);
     return 1;
 }
 
@@ -153,6 +153,7 @@ static bool add_user(int sockfd, char* command) {
         _agate_util_write_x_bytes_to_socket(sockfd, out, out_len);
         mysql_close(db_con);
         mysql_free_result(result);
+        free(out);
         return 0;
     }
     mysql_free_result(result);
@@ -173,6 +174,7 @@ static bool add_user(int sockfd, char* command) {
     _agate_util_write_x_bytes_to_socket(sockfd, out, out_len);
     mysql_close(db_con);
     free(query);
+    free(out);
     return 1;
 }
 
@@ -228,6 +230,7 @@ static bool add_group(int sockfd, char* command) {
         mysql_close(db_con);
         mysql_free_result(result);
         free(query);
+        free(out);
         return 0;
     }
     mysql_free_result(result);
@@ -248,6 +251,7 @@ static bool add_group(int sockfd, char* command) {
     _agate_util_write_x_bytes_to_socket(sockfd, out, out_len);
     mysql_close(db_con);
     free(query);
+    free(out);
     return 1;
 }
 
@@ -307,6 +311,7 @@ static bool add_user_to_group(int sockfd, char* command) {
         mysql_close(db_con);
         mysql_free_result(result);
         free(query);
+        free(out);
         return 0;
     }
     mysql_free_result(result);
@@ -333,6 +338,7 @@ static bool add_user_to_group(int sockfd, char* command) {
         mysql_close(db_con);
         mysql_free_result(result);
         free(query);
+        free(out);
         return 0;
     } else {
         assert(row[0] != NULL);
@@ -362,6 +368,7 @@ static bool add_user_to_group(int sockfd, char* command) {
         mysql_close(db_con);
         mysql_free_result(result);
         free(query);
+        free(out);
         return 0;
     } else {
         assert(row[0] != NULL);
@@ -391,6 +398,7 @@ static bool add_user_to_group(int sockfd, char* command) {
         mysql_close(db_con);
         mysql_free_result(result);
         free(query);
+        free(out);
         return 0;
     }
     mysql_free_result(result);
@@ -411,12 +419,229 @@ static bool add_user_to_group(int sockfd, char* command) {
     _agate_util_write_x_bytes_to_socket(sockfd, out, out_len);
     mysql_close(db_con);
     free(query);
+    free(out);
     return 1;
 }
 
-static bool can_flow(int sockfd, char* command) {
+static bool _is_user_in_users(int user, char* user_readers, int u_len) {
+    int reader;
+
+    for (int i = 0; i < u_len; i++) {
+        user_readers = _agate_util_get_int(user_readers, &reader);
+        if (user == reader) {
+            return true;
+        }
+    }
+    return false;
 }
 
+static bool _is_user_in_groups(int user, char* group_readers, int g_len) {
+    int group;    
+
+    /* Initialize DB structure */
+    MYSQL* db_con = mysql_init(NULL);
+    if (db_con == NULL) {
+        _finish_with_error(db_con, false);
+    }
+    
+    /* Open DB connection */
+    if (mysql_real_connect(db_con, "localhost", "root", "root", 
+          "UserManagementService", 0, NULL, 0) == NULL) {
+        _finish_with_error(db_con, false);
+    }
+
+    char* query = (char*)malloc(100);
+
+    for (int i = 0; i < g_len; i++) {
+        group_readers = _agate_util_get_int(group_readers, &group);
+
+        /* Check if user in the group */
+        sprintf(query, "SELECT ug.id FROM UserGroups ug WHERE ug.groupID=%d and ug.userID=%d;", group, user);
+
+        if (mysql_query(db_con, query)) {
+            _finish_with_error(db_con, false);
+        }
+
+        MYSQL_RES *result = mysql_store_result(db_con);
+        if (result == NULL) {
+            _finish_with_error(db_con, false);
+        }
+
+        MYSQL_ROW row = mysql_fetch_row(result);
+        if (row != NULL) { // user in the group
+             mysql_free_result(result);
+             free(query);
+             mysql_close(db_con);
+             return true;
+        }
+    }
+
+    free(query);
+    mysql_close(db_con);
+    return false;
+}
+
+
+/* Checks if a user is a reader in all policies*/
+static bool _is_user_in_all_policies(int user, char* from_users) {
+    int total_u_len, total_g_len, u_len, g_len;
+    char* from_groups;
+
+    from_users = _agate_util_get_int(from_users, &total_u_len); // total number of users
+    from_groups = from_users + total_u_len * sizeof(int);
+    from_groups = _agate_util_get_int(from_groups, &total_g_len); // total number of groups
+
+    while(total_u_len > 0) {
+        from_users = _agate_util_get_int(from_users, &u_len); // number of users in next policy
+        from_groups = _agate_util_get_int(from_groups, &g_len); // number of groups in next policy
+        if ((_is_user_in_users(user, from_users, u_len) || _is_user_in_groups(user, from_groups, g_len)) == false)
+            return false;
+        from_users += u_len * sizeof(int);
+        from_groups += g_len * sizeof(int); 
+
+        total_u_len -= (u_len + 1);
+    }
+    return true;
+}
+
+static bool can_flow(int sockfd, char* command) {
+    int size;
+    int to_policy_reader;
+
+    /* Get the reader from to_policy */
+    command = _agate_util_get_int(command, &size); // consume size of policy in bytes
+    assert(size == 20);
+    command = _agate_util_get_int(command, &size); // consume length of readers vector
+    assert(size == 2); // just one reader, no groups
+    command = _agate_util_get_int(command, &size); // consume number of readers
+    assert(size == 1); // just one reader, no groups
+    command = _agate_util_get_int(command, &to_policy_reader); // get the to reader
+    command = _agate_util_get_int(command, &size); // get the length of groups vector 
+    assert(size == 1);
+    command = _agate_util_get_int(command, &size); // get the group length
+    assert(size == 0);
+    command = _agate_util_get_int(command, &size); // consume the size of from_policy
+
+    /* Initialize result */
+    int out_len = 2 * sizeof(int);
+    char* out = (char*)malloc(out_len);
+    char* tmp =_agate_util_add_int(out, sizeof(int));
+    _agate_util_add_int(tmp, 0);
+
+    if (_is_user_in_all_policies(to_policy_reader, command)) {
+        _agate_util_add_int(tmp, 1);
+    }
+
+    _agate_util_write_x_bytes_to_socket(sockfd, out, out_len);
+    free(out);
+    return 1;
+}
+
+static bool get_users_and_groups_ids(int sockfd, char* command) {
+    int total_len, u_len, g_len, owner;
+    char* command_tmp;
+    command = _agate_util_get_int(command, &owner);
+    command = _agate_util_get_int(command, &total_len);
+
+    /* Initialize result */
+    int out_len = (total_len + 3) * sizeof(int);
+    char* out = (char*)malloc(out_len);
+    char* out_tmp = _agate_util_add_int(out, out_len - sizeof(int));
+    char* query = (char*)malloc(256);
+
+
+    /* Initialize DB structure */
+    MYSQL* db_con = mysql_init(NULL);
+    if (db_con == NULL) {
+        _finish_with_error(db_con, false);
+    }
+
+    /* Open DB connection */
+    if (mysql_real_connect(db_con, "localhost", "root", "root", 
+          "UserManagementService", 0, NULL, 0) == NULL) {
+        _finish_with_error(db_con, false);
+    }
+
+    /* Get user IDs */
+    command = _agate_util_get_int(command, &u_len);
+    out_tmp = _agate_util_add_int(out_tmp, u_len);
+
+    if (u_len) {
+        // TODO: not thread safe
+        command_tmp = strtok(command, " ");
+        for (int i = 0; i < u_len; i++) {
+            sprintf(query, "SELECT u.userID FROM Users u WHERE u.username=\'%s\';", command_tmp);
+            printf("    Looking up user: %s\n", command_tmp);
+
+            assert(command_tmp != NULL);
+            command += strlen(command_tmp) + 1; // get past space
+
+            if (mysql_query(db_con, query)) {
+                _finish_with_error(db_con, false);
+            }
+
+            MYSQL_RES *result = mysql_store_result(db_con);
+            if (result == NULL) {
+                _finish_with_error(db_con, false);
+            }
+
+            int userId = -1;
+            MYSQL_ROW row = mysql_fetch_row(result);
+            if (row != NULL) {
+                userId = atoi(row[0]);
+                printf("    Found user id: %d\n", userId);
+            } else {
+                printf("ERROR - couldn't find user");
+            }
+            out_tmp = _agate_util_add_int(out_tmp, userId);
+            command_tmp = strtok(NULL, " ");
+            mysql_free_result(result);
+        }
+    }
+
+    /* Get group IDs */
+    command = _agate_util_get_int(command, &g_len);
+    out_tmp = _agate_util_add_int(out_tmp, g_len);
+
+    if (g_len) {
+        // TODO: not thread safe
+        command_tmp = strtok(command, " ");
+        for (int i = 0; i < g_len; i++) {
+            sprintf(query, "SELECT g.groupID FROM Groups g WHERE g.groupName=\'%s\' and g.owner=%d;", command_tmp, owner);
+            printf("    Looking up group: %s\n", command_tmp);
+
+            if (mysql_query(db_con, query)) {
+                _finish_with_error(db_con, false);
+            }
+
+            MYSQL_RES *result = mysql_store_result(db_con);
+            if (result == NULL) {
+                _finish_with_error(db_con, false);
+            }
+
+            int groupId = -1;
+            MYSQL_ROW row = mysql_fetch_row(result);
+            if (row != NULL) { // user in the group
+                groupId = atoi(row[0]);
+                printf("    Found group id: %d\n", groupId);
+                out_tmp = _agate_util_add_int(out_tmp, groupId);
+            } else {
+                printf("ERROR - couldn't find group");
+            }
+            command_tmp= strtok(NULL, " ");
+            mysql_free_result(result);
+        }
+    }
+
+    _agate_util_write_x_bytes_to_socket(sockfd, out, out_len);
+    printf("  Done.\n");
+    free(out);
+    free(query);
+    mysql_close(db_con);
+    return 1;
+}
+
+/* The results sent must first be preceded by the len of the message */
 void* process_connection(void* ptr) {
     char command_type;
     connection_t* conn;
@@ -451,6 +676,10 @@ void* process_connection(void* ptr) {
        case '5':
            printf("Processing can_flow request.\n");
            can_flow(conn->sockfd, command);
+           break;
+       case '6':
+           printf("Processing get_users_and_groups_ids request.\n");
+           get_users_and_groups_ids(conn->sockfd, command);
            break;
        default :
            fprintf(stderr, "UMS: error: command not supported.\n");
